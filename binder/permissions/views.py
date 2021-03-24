@@ -41,6 +41,42 @@ class Scope(Enum):
 
 
 class PermissionView(ModelView):
+	"""
+	This view enforces permissions with the possibility of defining object scopes.
+
+	Binder permissions are generally specified as a combination of a Django permission,
+	combined with a scope in the following way:
+
+		('{app_name}.{method}_{model}', '{scope}')
+
+	where method is one of 'view', 'add', 'change' or 'delete' (custom methods are not yet
+	supported). A scope basically defines a subset of the model instances (objects) that
+	a user is allowed to perform some action on.
+
+	The enforcement of a particular scope may be implemented in a scope function of one
+	of the following signatures:
+
+		`_scope_view_{scope}(self, request)`
+		`_scope_{add/change/delet}_{scope}(self, request, object, values)`
+
+	Scope functions for the 'view' method may return a queryset of a `Q` object. The
+	default behavior for the view method is to compute the subset for each scope that the
+	user is allowed to see and then combine these by taking the union.
+
+	Scope functions for the other methods just return a boolean whether the user may
+	perform the action. The default behavior here is to allow the user access if at least
+	one scope allows access.
+
+	The scope 'all' is implemented by default and, as the name indicates, defines access
+	to all objects in the default queryset.
+
+	When no scope function is found for a scope, the method `dynamic_scope` is
+	called with the name of the scope, which thows an error by default. However, this
+	method may be overridden to implement dynamically defining scopes. For example, a
+	mixin class may be created that enforces scopes based on the existance of a
+	particular relation to another model (which may for example represent ownership).
+	"""
+
 	@property
 	def _permission_definition(self):
 		return settings.BINDER_PERMISSION
@@ -55,8 +91,13 @@ class PermissionView(ModelView):
 
 	def _require_model_perm(self, perm_type, request, pk=None):
 		"""
-		Check if you have a model permission, and return the scopes
+		Returns the scopes that the user has for the requested method.
+		Raises `BinderForbidden` if the user does not have any applicable
+		scope for this method.
 		"""
+
+		# The `perms_via` attribute may be used to use the exact same permissions
+		# as another model.
 		if hasattr(self, 'perms_via'):
 			model = self.perms_via
 		else:
@@ -223,11 +264,7 @@ class PermissionView(ModelView):
 		can_add = False
 
 		for s in scopes:
-			scope_name = '_scope_add_{}'.format(s)
-			if getattr(self, scope_name, None) is None:
-				raise UnexpectedScopeException(
-					'Scope {} is not implemented for model {}'.format(scope_name, self.model))
-			can_add |= getattr(self, scope_name)(request, object, values)
+			can_add |= self._scope_func('add', s, request, object, values)
 
 		if not can_add:
 			raise ScopingError(user=request.user, perm='You do not have a scope that allows you to add model={}'.format(self.model))
@@ -241,11 +278,7 @@ class PermissionView(ModelView):
 		can_change = False
 
 		for s in scopes:
-			scope_name = '_scope_change_{}'.format(s)
-			if getattr(self, scope_name, None) is None:
-				raise UnexpectedScopeException(
-					'Scope {} is not implemented for model {}'.format(scope_name, self.model))
-			can_change |= getattr(self, scope_name)(request, object, values)
+			can_change |= self._scope_func('change', s, request, object, values)
 
 		if not can_change:
 			raise ScopingError(user=request.user, perm='You do not have a scope that allows you to change model={}'.format(self.model))
@@ -274,12 +307,8 @@ class PermissionView(ModelView):
 		scope_queries = []
 		scope_querysets = []
 		for s in scopes:
-			scope_name = '_scope_view_{}'.format(s)
-			scope_func = getattr(self, scope_name, None)
-			if scope_func is None:
-				raise UnexpectedScopeException(
-					'Scope {} is not implemented for model {}'.format(scope_name, self.model))
-			query_or_q = scope_func(request)
+			query_or_q = self._scope_func('view', s, request)
+
 			# Allow either a ORM filter query manager or a Q object.
 			# Q objects generate more efficient queries (so we don't
 			# get an "id IN (subquery)"), but query managers allow
@@ -307,6 +336,20 @@ class PermissionView(ModelView):
 
 
 
+	def _scope_func(self, action_type, scope, request, *args):
+		"""
+		Tries to do a static scope enforcement function by calling
+		`_scope_{method}_{scope}`.
+		"""
+		scope_name = '_scope_{}_{}'.format(action_type, scope)
+		scope_func = getattr(self, scope_name, None)
+		if scope_func is None:
+			raise UnexpectedScopeException(
+				'Scope {} is not implemented for model {}'.format(scope, self.model))
+		return scope_func(request, *args)
+
+
+
 	def delete_obj(self, obj, undelete, request):
 		self.scope_delete(request, obj, {})
 		return super().delete_obj(obj, undelete, request)
@@ -315,20 +358,15 @@ class PermissionView(ModelView):
 
 	def scope_delete(self, request, object, values):
 		"""
-		Performs the scopes for deletion of an obbject
+		Performs the scopes for deletion of an object
 		"""
 		scopes = self._require_model_perm('delete', request)
 
 		can_change = False
 
 		for s in scopes:
-			scope_name = '_scope_delete_{}'.format(s)
-			if getattr(self, scope_name, None) is None:
-				raise UnexpectedScopeException(
-					'Scope {} is not implemented for model {}'.format(scope_name, self.model))
-			scope_func = getattr(self, scope_name)
 			try:
-				scope = scope_func(request, object, values)
+				scope = self._scope_func('delete', s, request, object, values)
 			except Exception as e:
 				# Call with queryset instead of object for backwards compat
 				try:
